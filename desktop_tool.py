@@ -10,8 +10,8 @@ from nv12_preprocess import NV12ToNPUTensorConverter
 class NV12DesktopTool:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("NV12 → NPU 텐서 변환기 (PC 툴)")
-        self.root.geometry("640x420")
+        self.root.title("NV12/P010 → NPU 텐서 변환기 (PC 툴)")
+        self.root.geometry("700x480")
 
         self.input_path = tk.StringVar()
         self.output_dir = tk.StringVar(value=os.getcwd())
@@ -20,13 +20,15 @@ class NV12DesktopTool:
         self.iso = tk.StringVar(value="800")
         self.exposure = tk.StringVar(value="10.0")
         self.noise_scale = tk.StringVar(value="0.0001")
+        self.pixel_format = tk.StringVar(value="auto")
+        self.frame_index = tk.StringVar(value="0")
 
         self._build_ui()
 
     def _build_ui(self) -> None:
         pad = {"padx": 8, "pady": 6}
 
-        tk.Label(self.root, text="NV12 입력 파일").grid(row=0, column=0, sticky="w", **pad)
+        tk.Label(self.root, text="입력 파일 (NV12 / P010)").grid(row=0, column=0, sticky="w", **pad)
         tk.Entry(self.root, textvariable=self.input_path, width=55).grid(row=0, column=1, **pad)
         tk.Button(self.root, text="찾기", command=self._browse_input).grid(row=0, column=2, **pad)
 
@@ -49,16 +51,22 @@ class NV12DesktopTool:
         tk.Label(self.root, text="Noise Scale").grid(row=6, column=0, sticky="w", **pad)
         tk.Entry(self.root, textvariable=self.noise_scale, width=20).grid(row=6, column=1, sticky="w", **pad)
 
+        tk.Label(self.root, text="Pixel Format").grid(row=7, column=0, sticky="w", **pad)
+        tk.OptionMenu(self.root, self.pixel_format, "auto", "nv12", "p010").grid(row=7, column=1, sticky="w", **pad)
+
+        tk.Label(self.root, text="Frame Index").grid(row=8, column=0, sticky="w", **pad)
+        tk.Entry(self.root, textvariable=self.frame_index, width=20).grid(row=8, column=1, sticky="w", **pad)
+
         tk.Button(self.root, text="전처리 실행", command=self._run, bg="#2e7d32", fg="white").grid(
-            row=7, column=1, sticky="w", **pad
+            row=9, column=1, sticky="w", **pad
         )
 
-        self.result_text = tk.Text(self.root, height=10, width=78)
-        self.result_text.grid(row=8, column=0, columnspan=3, padx=8, pady=10)
+        self.result_text = tk.Text(self.root, height=11, width=84)
+        self.result_text.grid(row=10, column=0, columnspan=3, padx=8, pady=10)
         self.result_text.insert(tk.END, "준비 완료.\n")
 
     def _browse_input(self) -> None:
-        path = filedialog.askopenfilename(title="NV12 파일 선택", filetypes=[("NV12", "*.nv12"), ("All", "*.*")])
+        path = filedialog.askopenfilename(title="원본 파일 선택", filetypes=[("Raw", "*.*")])
         if path:
             self.input_path.set(path)
 
@@ -80,13 +88,15 @@ class NV12DesktopTool:
             iso = float(self.iso.get())
             exposure = float(self.exposure.get())
             noise_scale = float(self.noise_scale.get())
+            pixel_format = self.pixel_format.get().strip().lower()
+            frame_index = int(self.frame_index.get())
 
             if not input_path or not os.path.isfile(input_path):
-                raise ValueError("유효한 NV12 입력 파일을 선택해 주세요.")
+                raise ValueError("유효한 입력 파일을 선택해 주세요.")
             if not os.path.isdir(output_dir):
                 raise ValueError("유효한 출력 폴더를 선택해 주세요.")
             if width % 2 != 0 or height % 2 != 0:
-                raise ValueError("NV12 특성상 width/height는 짝수여야 합니다.")
+                raise ValueError("NV12/P010 특성상 width/height는 짝수여야 합니다.")
 
             converter = NV12ToNPUTensorConverter(noise_scale=noise_scale)
             tensor = converter.convert(
@@ -95,6 +105,8 @@ class NV12DesktopTool:
                 height=height,
                 iso=iso,
                 exposure_time=exposure,
+                pixel_format=pixel_format,
+                frame_index=frame_index,
             )
 
             output_npy = os.path.join(output_dir, "npu_input_tensor.npy")
@@ -105,17 +117,19 @@ class NV12DesktopTool:
             self._append(f"Tensor shape: {tensor.shape}")
             self._append(f"Tensor dtype: {tensor.dtype}")
             self._append("채널 순서: [Y, U, V, Noise_Map, ISO_Map]")
+            self._append(f"사용 포맷: {pixel_format}, frame_index={frame_index}")
 
             messagebox.showinfo("성공", "전처리가 완료되었습니다.")
 
         except Exception as exc:
             self._append(f"오류: {exc}")
+            self._append("힌트: 파일 크기가 2배면 Pixel Format을 p010으로 바꾸거나 frame_index를 확인하세요.")
             messagebox.showerror("실패", str(exc))
 
 
 def main() -> None:
     root = tk.Tk()
-    app = NV12DesktopTool(root)
+    NV12DesktopTool(root)
     root.mainloop()
 
 

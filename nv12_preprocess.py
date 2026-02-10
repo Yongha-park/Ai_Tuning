@@ -15,7 +15,7 @@ class ISPMetadata:
 
 
 class NV12ToNPUTensorConverter:
-    """Convert NV12 frame + metadata into NCHW tensor for NPU input."""
+    """Convert NV12/P010 frame + metadata into NCHW tensor for NPU input."""
 
     def __init__(self, noise_scale: float = 1e-4) -> None:
         self.noise_scale = float(noise_scale)
@@ -27,14 +27,18 @@ class NV12ToNPUTensorConverter:
         height: int,
         iso: float,
         exposure_time: float,
+        pixel_format: str = "auto",
+        frame_index: int = 0,
     ) -> np.ndarray:
         """
         Args:
-            image_path: Raw NV12 file path.
+            image_path: Raw NV12/P010 file path.
             width: Frame width.
             height: Frame height.
             iso: ISO / analog gain scalar.
             exposure_time: Exposure time in milliseconds.
+            pixel_format: "auto", "nv12", or "p010".
+            frame_index: Frame index for multi-frame raw files.
 
         Returns:
             output tensor with shape (1, 5, H, W), dtype float32.
@@ -42,13 +46,14 @@ class NV12ToNPUTensorConverter:
         """
         metadata = ISPMetadata(iso=float(iso), exposure_time_ms=float(exposure_time))
 
-        y_plane, uv_plane = self._load_nv12_planes(image_path, width, height)
-        u_full, v_full = self._deinterleave_and_upsample_uv(uv_plane, width, height)
-
-        # Normalize all image channels to [0, 1], shape remains (H, W)
-        y_norm = y_plane.astype(np.float32) / 255.0
-        u_norm = u_full.astype(np.float32) / 255.0
-        v_norm = v_full.astype(np.float32) / 255.0
+        y_norm, uv_norm = self._load_luma_chroma_planes(
+            image_path=image_path,
+            width=width,
+            height=height,
+            pixel_format=pixel_format,
+            frame_index=frame_index,
+        )
+        u_norm, v_norm = self._deinterleave_and_upsample_uv(uv_norm, width, height)
 
         # Broadcast scalar metadata into feature maps with shape (H, W)
         noise_map = np.full((height, width), metadata.iso * self.noise_scale, dtype=np.float32)
@@ -62,22 +67,93 @@ class NV12ToNPUTensorConverter:
         return nchw
 
     @staticmethod
-    def _load_nv12_planes(image_path: str, width: int, height: int) -> tuple[np.ndarray, np.ndarray]:
-        expected_size = width * height * 3 // 2
+    def _load_luma_chroma_planes(
+        image_path: str,
+        width: int,
+        height: int,
+        pixel_format: str,
+        frame_index: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if frame_index < 0:
+            raise ValueError("frame_index must be >= 0")
+
         raw = np.fromfile(image_path, dtype=np.uint8)
+        raw_size = raw.size
 
-        if raw.size != expected_size:
+        nv12_frame_bytes = width * height * 3 // 2
+        p010_frame_bytes = width * height * 3
+
+        fmt = pixel_format.lower().strip()
+        if fmt not in {"auto", "nv12", "p010"}:
+            raise ValueError("pixel_format must be one of: auto, nv12, p010")
+
+        if fmt == "auto":
+            nv12_ok = raw_size % nv12_frame_bytes == 0
+            p010_ok = raw_size % p010_frame_bytes == 0
+
+            if nv12_ok and p010_ok:
+                raise ValueError(
+                    "Ambiguous raw size: file matches both multi-frame NV12 and P010. "
+                    "Please set pixel_format explicitly to 'nv12' or 'p010'."
+                )
+            if nv12_ok:
+                fmt = "nv12"
+            elif p010_ok:
+                fmt = "p010"
+            else:
+                raise ValueError(
+                    f"Invalid raw size for both NV12/P010. size={raw_size}, "
+                    f"nv12_frame={nv12_frame_bytes}, p010_frame={p010_frame_bytes}, path={image_path}"
+                )
+
+        if fmt == "nv12":
+            if raw_size % nv12_frame_bytes != 0:
+                raise ValueError(
+                    f"Invalid NV12 size. expected multiple of {nv12_frame_bytes}, got={raw_size}, path={image_path}"
+                )
+            frame_count = raw_size // nv12_frame_bytes
+            if frame_index >= frame_count:
+                raise ValueError(f"frame_index out of range. frame_count={frame_count}, frame_index={frame_index}")
+
+            start = frame_index * nv12_frame_bytes
+            end = start + nv12_frame_bytes
+            frame = raw[start:end]
+
+            y_size = width * height
+            y_plane = frame[:y_size].reshape(height, width).astype(np.float32) / 255.0
+            uv_plane = frame[y_size:].reshape(height // 2, width).astype(np.float32) / 255.0
+            return y_plane, uv_plane
+
+        # p010 path (16-bit container, usually 10-bit valid)
+        if raw_size % p010_frame_bytes != 0:
             raise ValueError(
-                f"Invalid NV12 size. expected={expected_size}, got={raw.size}, "
-                f"path={image_path}"
+                f"Invalid P010 size. expected multiple of {p010_frame_bytes}, got={raw_size}, path={image_path}"
             )
+        frame_count = raw_size // p010_frame_bytes
+        if frame_index >= frame_count:
+            raise ValueError(f"frame_index out of range. frame_count={frame_count}, frame_index={frame_index}")
 
-        y_size = width * height
-        y_plane = raw[:y_size].reshape(height, width)
+        frame_samples_u16 = width * height * 3 // 2
+        all_u16 = np.fromfile(image_path, dtype=np.uint16)
+        start_s = frame_index * frame_samples_u16
+        end_s = start_s + frame_samples_u16
+        frame_u16 = all_u16[start_s:end_s]
 
-        # NV12 UV plane has half vertical resolution and interleaved UV pairs
-        uv_plane = raw[y_size:].reshape(height // 2, width)
-        return y_plane, uv_plane
+        y_size_s = width * height
+        y_u16 = frame_u16[:y_size_s].reshape(height, width)
+        uv_u16 = frame_u16[y_size_s:].reshape(height // 2, width)
+
+        # P010 often stores 10-bit values in MSBs of 16-bit (value << 6)
+        if int(y_u16.max(initial=0)) > 1023 or int(uv_u16.max(initial=0)) > 1023:
+            y_10 = (y_u16 >> 6).astype(np.float32)
+            uv_10 = (uv_u16 >> 6).astype(np.float32)
+        else:
+            y_10 = y_u16.astype(np.float32)
+            uv_10 = uv_u16.astype(np.float32)
+
+        y_norm = np.clip(y_10 / 1023.0, 0.0, 1.0)
+        uv_norm = np.clip(uv_10 / 1023.0, 0.0, 1.0)
+        return y_norm, uv_norm
 
     @staticmethod
     def _deinterleave_and_upsample_uv(
@@ -88,8 +164,8 @@ class NV12ToNPUTensorConverter:
         v_half = uv_plane[:, 1::2]
 
         # Bilinear upsampling to match Y plane resolution: (H, W)
-        u_full = cv2.resize(u_half, (width, height), interpolation=cv2.INTER_LINEAR)
-        v_full = cv2.resize(v_half, (width, height), interpolation=cv2.INTER_LINEAR)
+        u_full = cv2.resize(u_half, (width, height), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+        v_full = cv2.resize(v_half, (width, height), interpolation=cv2.INTER_LINEAR).astype(np.float32)
         return u_full, v_full
 
 
@@ -119,6 +195,8 @@ if __name__ == "__main__":
             height=h,
             iso=iso,
             exposure_time=exposure_ms,
+            pixel_format="nv12",
+            frame_index=0,
         )
 
         print("Output tensor shape:", tensor.shape)
