@@ -1,5 +1,27 @@
+import importlib.util
+import sys
 import tempfile
 from pathlib import Path
+
+
+def _missing_modules() -> list[str]:
+    required = ["numpy", "streamlit", "cv2"]
+    return [name for name in required if importlib.util.find_spec(name) is None]
+
+
+missing = _missing_modules()
+if missing:
+    print(
+        "[오류] 필수 모듈이 설치되어 있지 않습니다:\n"
+        f"  - {', '.join(missing)}\n"
+        "다음 명령으로 설치 후 다시 실행하세요:\n"
+        "  pip install -r requirements.txt\n"
+        "또는\n"
+        "  pip install numpy opencv-python streamlit\n"
+        "실행 명령:\n"
+        "  streamlit run streamlit_app.py"
+    )
+    sys.exit(1)
 
 import numpy as np
 import streamlit as st
@@ -74,7 +96,6 @@ with col2:
                 st.write(f"Dtype: **{tensor.dtype}**")
                 st.write("채널 순서: **[Y, U, V, Noise_Map, ISO_Map]**")
 
-                # NCHW -> channel 2D maps
                 channel_names = ["Y", "U", "V", "Noise_Map", "ISO_Map"]
                 tabs = st.tabs(channel_names)
                 for i, name in enumerate(channel_names):
